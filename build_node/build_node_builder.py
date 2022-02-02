@@ -9,15 +9,18 @@ CloudLinux Build System build thread implementation.
 import datetime
 import logging
 import os
-import urllib
+import urllib.parse
 import platform
 import random
 import threading
-import traceback
+import typing
 
 import yaml
 import requests
+import requests.adapters
+from requests.packages.urllib3.util.retry import Retry
 
+from build_node import constants
 from build_node.builders import get_suitable_builder
 from build_node.build_node_errors import BuildError, BuildExcluded
 from build_node.uploaders.pulp import PulpRpmUploader
@@ -59,6 +62,7 @@ class BuildNodeBuilder(threading.Thread):
         self.__sentry = Sentry(config.sentry_dsn)
         # current task builder object
         self.__builder = None
+        self.__session = None
         self._pulp_uploader = PulpRpmUploader(
             self.__config.pulp_host, self.__config.pulp_user,
             self.__config.pulp_password, self.__config.pulp_chunk_size
@@ -71,7 +75,8 @@ class BuildNodeBuilder(threading.Thread):
         log_file = os.path.join(self.__working_dir,
                                 'bt-{0}.log'.format(self.name))
         self.__logger = self.init_thread_logger(log_file)
-        self.__logger.info('starting {0}'.format(self.name))
+        self.__logger.info('starting %s', self.name)
+        self.__generate_request_session()
         while not self.__graceful_terminated_event.is_set():
             task = self.__request_task()
             if not task:
@@ -80,61 +85,68 @@ class BuildNodeBuilder(threading.Thread):
                 continue
             self.__current_task_id = task.id
             self.__start_ts = datetime.datetime.utcnow()
+            ts = int(self.__start_ts.timestamp())
             task_dir = os.path.join(self.__working_dir, str(task.id))
             artifacts_dir = os.path.join(task_dir, 'artifacts')
-            task_log_file = os.path.join(task_dir, 'albs.log')
+            task_log_file = os.path.join(task_dir, f'albs.{ts}.log')
             task_log_handler = None
             success = False
             excluded = False
-            excluded_exception = None
-            build_artifacts = []
             try:
-                self.__logger.info(f'processing the task:\n{task}')
+                self.__logger.info('processing the task:\n%s', task)
                 os.makedirs(artifacts_dir)
                 task_log_handler = self.__init_task_logger(task_log_file)
                 self.__build_packages(task, task_dir, artifacts_dir)
-                build_artifacts = self.__upload_artifacts(
-                    task, artifacts_dir, task_log_file)
                 success = True
             except BuildError as e:
-                self.__logger.error('task {0} build failed: {1}'.
-                                    format(task.id, str(e)))
+                self.__logger.exception(
+                    'task %i build failed: %s.',
+                    task.id,
+                    str(e),
+                )
             except BuildExcluded as ee:
-                excluded_exception = ee
                 excluded = True
                 self.__logger.info(
-                    'task {0} build excluded: {1}'.format(
-                        task.id, str(excluded_exception)))
+                    'task %i build excluded: %s',
+                    task.id,
+                    str(ee),
+                )
             except Exception as e:
-                self.__logger.error('task {0} build failed: {1}. '
-                                    'Traceback:\n{2}'.
-                                    format(task.id, str(e),
-                                           traceback.format_exc()))
+                self.__logger.exception(
+                    'task %i build failed: %s.',
+                    task.id,
+                    str(e),
+                )
                 self.__sentry.capture_exception(e)
             finally:
-                if not success:
-                    try:
-                        build_artifacts = self.__upload_artifacts(
-                            task, artifacts_dir, task_log_file)
-                        if excluded_exception is not None:
-                            self.__report_excluded_task(
-                                task, build_artifacts)
-                    except Exception as e:
-                        self.__logger.error(
-                            'Cannot upload task artifacts: {0}. '
-                            'Traceback:\n{1}'.format(
-                                str(e), traceback.format_exc()))
-                        self.__sentry.capture_exception(e)
-                if not excluded:
-                    self.__report_done_task(
-                        task, success=success, artifacts=build_artifacts)
+                try:
+                    build_artifacts = self.__upload_artifacts(
+                        artifacts_dir, task_log_file, only_logs=(not success))
+                except Exception as e:
+                    self.__logger.exception('Cannot upload task artifacts: %s',
+                                            str(e))
+                    build_artifacts = []
+
+                try:
+                    if not success and excluded:
+                        self.__report_excluded_task(
+                            task, build_artifacts)
+                    else:
+                        self.__report_done_task(
+                            task, success=success, artifacts=build_artifacts)
+                except Exception as e:
+                    self.__logger.exception(
+                        'Cannot report task status to the main node: %s', str(e)
+                    )
                 if task_log_handler:
                     self.__close_task_logger(task_log_handler)
                 self.__current_task_id = None
                 self.__start_ts = None
                 if os.path.exists(task_dir):
-                    self.__logger.debug('cleaning up task build directory'
-                                        ' {0}'.format(task_dir))
+                    self.__logger.debug(
+                        'cleaning up task build directory %s',
+                        task_dir,
+                    )
                     # NOTE: sometimes source files have weird permissions
                     #       which makes their deletion merely impossible
                     #       without root permissions
@@ -147,21 +159,23 @@ class BuildNodeBuilder(threading.Thread):
 
         Parameters
         ----------
-        task : dict
+        task : Task
             Build task information.
         task_dir : str
             Build task working directory path.
         artifacts_dir : str
             Build artifacts storage directory path.
         """
-        self.__logger.info('building on the {0} node'.format(platform.node()))
+        self.__logger.info('building on the %s node', platform.node())
         builder_class = get_suitable_builder(task)
         self.__builder = builder_class(self.__config, self.__logger, task,
                                        task_dir, artifacts_dir)
         self.__builder.build()
 
-    def __upload_artifacts(self, task, artifacts_dir, task_log_file):
-        artifacts = self._pulp_uploader.upload(artifacts_dir)
+    def __upload_artifacts(self, artifacts_dir, task_log_file,
+                           only_logs: bool = False):
+        artifacts = self._pulp_uploader.upload(
+            artifacts_dir, only_logs=only_logs)
         build_stats = self.__builder.get_build_stats()
         build_stats_path = os.path.join(artifacts_dir, 'build_stats.yml')
         with open(build_stats_path, 'w') as fd:
@@ -178,18 +192,15 @@ class BuildNodeBuilder(threading.Thread):
         supported_arches = [self.__config.base_arch]
         if self.__config.base_arch == 'x86_64':
             supported_arches.append('i686')
-        task = None
-        try:
-            task = self.__call_master(
-                'get_task', supported_arches=supported_arches
-            )
-        except Exception:
-            self.__logger.error(
-                f"Can't request new task from master:\n"
-                f"{traceback.format_exc()}"
-            )
+        task = self.__call_master(
+            'get_task',
+            err_msg="Can't request new task from master:",
+            supported_arches=supported_arches,
+        )
         if not task:
             return
+        if not task.get('is_secure_boot'):
+            task['is_secure_boot'] = False
         return Task(**task)
 
     def __report_excluded_task(self, task, artifacts):
@@ -198,7 +209,11 @@ class BuildNodeBuilder(threading.Thread):
             'status': 'excluded',
             'artifacts': [artifact.dict() for artifact in artifacts]
         }
-        self.__call_master('build_done', **kwargs)
+        self.__call_master(
+            'build_done',
+            err_msg="Can't mark the task as excluded:",
+            **kwargs,
+        )
 
     def __report_done_task(self, task, success=True, artifacts=None):
         if not artifacts:
@@ -208,22 +223,55 @@ class BuildNodeBuilder(threading.Thread):
             'status': 'done' if success else 'failed',
             'artifacts': [artifact.dict() for artifact in artifacts]
         }
-        self.__call_master('build_done', **kwargs)
+        self.__call_master(
+            'build_done',
+            err_msg="Can't mark the task as done:",
+            **kwargs,
+        )
 
-    def __call_master(self, endpoint, **parameters):
+    def __generate_request_session(self):
+        retry_strategy = Retry(
+            total=constants.TOTAL_RETRIES,
+            status_forcelist=constants.STATUSES_TO_RETRY,
+            method_whitelist=constants.METHODS_TO_RETRY,
+            backoff_factor=constants.BACKOFF_FACTOR,
+            raise_on_status=True,
+        )
+        adapter = requests.adapters.HTTPAdapter(
+            max_retries=retry_strategy)
+        self.__session = requests.Session()
+        self.__session.headers.update({
+            'Authorization': f'Bearer {self.__config.jwt_token}',
+        })
+        self.__session.mount('http://', adapter)
+        self.__session.mount('https://', adapter)
+
+    def __call_master(
+            self,
+            endpoint,
+            err_msg: typing.Optional[str] = '',
+            **parameters,
+    ):
         full_url = urllib.parse.urljoin(
             self.__config.master_url, f'build_node/{endpoint}')
-        headers = {'authorization': f'Bearer {self.__config.jwt_token}'}
         if endpoint == 'build_done':
-            response = requests.post(
-                full_url,
-                json=parameters,
-                headers=headers
-            )
+            session_method = self.__session.post
         else:
-            response = requests.get(full_url, json=parameters, headers=headers)
-        response.raise_for_status()
-        return response.json()
+            session_method = self.__session.get
+        try:
+            response = session_method(
+                full_url, json=parameters,
+                timeout=self.__config.request_timeout
+            )
+            # Special case when build was already done
+            if response.status_code == requests.codes.conflict:
+                return {}
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RetryError:
+            self.__logger.exception('Max retries exceeded. %s', err_msg)
+        except Exception:
+            self.__logger.exception('%s', err_msg)
 
     @staticmethod
     def init_working_dir(working_dir):
@@ -232,12 +280,12 @@ class BuildNodeBuilder(threading.Thread):
         builds.
         """
         if os.path.exists(working_dir):
-            logging.debug('cleaning the {0} working directory'.
-                          format(working_dir))
+            logging.debug('cleaning the %s working directory',
+                          working_dir)
             clean_dir(working_dir)
         else:
-            logging.debug('creating the {0} working directory'.
-                          format(working_dir))
+            logging.debug('creating the %s working directory',
+                          working_dir)
             os.makedirs(working_dir, 0o750)
 
     def __init_task_logger(self, log_file):
